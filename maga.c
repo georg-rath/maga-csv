@@ -97,12 +97,14 @@ void field_collect(void* str, size_t str_len, void* data) {
   if (rcbd->row.length == 0) {
     rcbd->row.length = str_len + 1;
     rcbd->row.text = gawk_malloc(str_len + 1);
-    snprintf(rcbd->row.text, str_len + 1, "%s", (char*)str);
+    memcpy(rcbd->row.text, (char*)str, str_len + 1);
+    rcbd->row.text[rcbd->row.length] = '\0';
   } else {
     const size_t len = rcbd->row.length + 1 + str_len + 1; // original + delim + new + null
-    char* new_row = gawk_malloc(len);
-    snprintf(new_row, len, "%s%c%s", rcbd->row.text, '\31', (char*)str);
-    free(rcbd->row.text);
+    char* new_row = gawk_realloc(rcbd->row.text, len);
+    new_row[rcbd->row.length+1] = '\31';
+    memcpy(new_row+rcbd->row.length + 2, (char*)str, str_len+1);
+    new_row[len] = '\0';
     rcbd->row.text = new_row;
     rcbd->row.length = len;
   }
