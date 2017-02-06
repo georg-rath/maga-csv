@@ -11,21 +11,25 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/param.h>
 
 #include "gawkapi.h"
 
 #define READ_SZ (1024 * 1024)
+
+static /*const*/ char RT_START = '\31';
+static const int RT_LEN = 1;
 
 /* Boilerplate code: */
 int plugin_is_GPL_compatible;
 
 // each field is a an array of array of strings.
 
-typedef struct srow {
-  char *text;
+typedef struct row{
+  size_t capacity;
   size_t length;
+  char* text;
 } row_t;
-// each queue of
 
 struct row_queue {
   size_t begin;
@@ -43,6 +47,8 @@ struct csv_state {
   char *read_buffer;
   struct row_queue *row_queue;
   struct row_cb_data rcbd;
+  char* rt_start;
+  int rt_len;
 };
 
 
@@ -90,46 +96,57 @@ static bool row_queue_empty(struct row_queue* rq) {
   return rq->begin == rq->end;
 }
 
-void field_collect(void* str, size_t str_len, void* data) {
+static row_t row_new(size_t capacity) {
+  assert(capacity > 0);
+  row_t rb = {
+    .capacity = capacity,
+    .length = 0,
+    .text = gawk_malloc(capacity)
+  };
+  return rb;
+}
+
+static void row_append(row_t *rb, char* s, size_t len) {
+  if (rb->length + len > rb->capacity) {
+    const size_t new_capacity = MAX(len, rb->capacity) * 2;
+    rb->text = gawk_realloc(rb->text, new_capacity);
+    rb->capacity = new_capacity;
+  }
+  memcpy(rb->text+ rb->length, s, len);
+  rb->length += len;
+}
+
+static void field_collect(void* str, size_t str_len, void* data) {
   //fprintf(stderr, "collect: \"%s\"\n", (char*)str);
   // TODO: make this grow with *2 or *1.4 so we dont have to reallocate and copy so much.
   struct row_cb_data* rcbd = (struct row_cb_data*)data;
-  if (rcbd->row.length == 0) {
-    rcbd->row.length = str_len + 1;
-    rcbd->row.text = gawk_malloc(str_len + 1);
-    memcpy(rcbd->row.text, (char*)str, str_len + 1);
-    rcbd->row.text[rcbd->row.length] = '\0';
-  } else {
-    const size_t len = rcbd->row.length + 1 + str_len + 1; // original + delim + new + null
-    char* new_row = gawk_realloc(rcbd->row.text, len);
-    new_row[rcbd->row.length+1] = '\31';
-    memcpy(new_row+rcbd->row.length + 2, (char*)str, str_len+1);
-    new_row[len] = '\0';
-    rcbd->row.text = new_row;
-    rcbd->row.length = len;
+  if (rcbd->row.capacity == 0) {
+    rcbd->row = row_new(100);
   }
+  if (rcbd->row.length > 0) {
+    row_append(&rcbd->row, "\31", 1);
+  }
+  row_append(&rcbd->row, str, str_len);
 }
 
-void row_collect(int c, void* data) {
+static void row_collect(int c, void* data) {
   //fprintf(stderr, "row collect\n");
   struct row_cb_data* rcbd = (struct row_cb_data*)data;
   row_queue_push_back(rcbd->rq, &rcbd->row);
   //fprintf(stderr, "row collect end: %d, %s\n", c, rcbd->row.text);
-  rcbd->row.text = NULL;
+  //rcbd->row.text = NULL;
   rcbd->row.length = 0;
 }
 
-int emit_record(char** out, row_t row, char** rt_start, size_t *rt_len) {
-  char *rt = gawk_malloc(sizeof(char));
-  *rt = '\31';
-  *rt_start = rt;
-  *rt_len = 1;
+static int emit_record(char** out, row_t row, char** rt_start, size_t *rt_len) {
+  *rt_start = &RT_START;
+  *rt_len = RT_LEN;
 
   *out = row.text;
   return row.length;
 }
 
-int csv_get_record(char **out, struct awk_input *iobuf, int *errcode, char **rt_start, size_t *rt_len) {
+static int csv_get_record(char **out, struct awk_input *iobuf, int *errcode, char **rt_start, size_t *rt_len) {
   //fprintf(stderr, "get_record\n");
   struct csv_state *state = (struct csv_state *)iobuf->opaque;
 
