@@ -1,2 +1,4 @@
+CFLAGS=-Wall -pedantic -std=c11 -g -O3 -fPIC -shared -march=native
+
 maga.so: maga.c
-	$(CC) -std=c11 -fPIC -shared -o maga.so maga.c -g -Wall -pedantic -lcsv
+	$(CC) $(CFLAGS) -o $@ $< -lcsv
