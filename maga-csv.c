@@ -1,3 +1,15 @@
+/**
+ * gawk csv parser
+ * (part of the 'make awk great again' project)
+ *
+ * this extension parses CSV files natively (libcsv) without using FPAT.
+ * in our tests this has reduced runtime considerably (approx 20x).
+ * currently this extension requires FS to be set to "\31".
+ *
+ * internally it uses a queue of row buffers to convert the output of
+ * libcsv to the gawk format.
+ */
+
 #include <csv.h>
 
 #include <stdio.h>
@@ -16,14 +28,12 @@
 #include "gawkapi.h"
 
 #define READ_SZ (1024 * 1024)
-
+#define ROW_INITIAL_CAPACITY (100)
 static /*const*/ char RT_START = '\31';
 static const int RT_LEN = 1;
 
 /* Boilerplate code: */
 int plugin_is_GPL_compatible;
-
-// each field is a an array of array of strings.
 
 typedef struct row{
   size_t capacity;
@@ -46,9 +56,10 @@ struct csv_state {
   struct csv_parser *parser;
   char *read_buffer;
   struct row_queue *row_queue;
-  struct row_cb_data rcbd;
-  char* rt_start;
-  int rt_len;
+  struct row_cb_data rcbd; /* row callback data */
+  char* rt_start; /* row terminator */
+  int rt_len; /* row terminator length */
+  char **out_to_free; /* text buffer of previous iteration */
 };
 
 
@@ -57,7 +68,7 @@ static awk_ext_id_t ext_id;
 static const char *ext_version = "1.0";
 
 static struct row_queue* row_queue_new() {
-  struct row_queue* rq = malloc(sizeof (struct row_queue));
+  struct row_queue* rq = gawk_malloc(sizeof (struct row_queue));
   rq->begin = 0;
   rq->end = 0;
   memset(rq->rows, 0, READ_SZ*sizeof(row_t));
@@ -76,8 +87,6 @@ static row_t row_queue_pop_front(struct row_queue* rq) {
   if (rq->begin == READ_SZ) {
     rq->begin = 0;
   }
-//  row_t empty_row = {0};
-//  rq->rows[rq->begin] = empty_row;
   return row;
 }
 
@@ -118,10 +127,9 @@ static void row_append(row_t *rb, char* s, size_t len) {
 
 static void field_collect(void* str, size_t str_len, void* data) {
   //fprintf(stderr, "collect: \"%s\"\n", (char*)str);
-  // TODO: make this grow with *2 or *1.4 so we dont have to reallocate and copy so much.
   struct row_cb_data* rcbd = (struct row_cb_data*)data;
   if (rcbd->row.capacity == 0) {
-    rcbd->row = row_new(100);
+    rcbd->row = row_new(ROW_INITIAL_CAPACITY);
   }
   if (rcbd->row.length > 0) {
     row_append(&rcbd->row, "\31", 1);
@@ -134,14 +142,14 @@ static void row_collect(int c, void* data) {
   struct row_cb_data* rcbd = (struct row_cb_data*)data;
   row_queue_push_back(rcbd->rq, &rcbd->row);
   //fprintf(stderr, "row collect end: %d, %s\n", c, rcbd->row.text);
-  //rcbd->row.text = NULL;
   rcbd->row.length = 0;
 }
 
-static int emit_record(char** out, row_t row, char** rt_start, size_t *rt_len) {
+static int emit_record(struct csv_state *state, char** out, row_t row, char** rt_start, size_t *rt_len) {
   *rt_start = &RT_START;
   *rt_len = RT_LEN;
 
+  state->out_to_free = out;
   *out = row.text;
   return row.length;
 }
@@ -150,13 +158,19 @@ static int csv_get_record(char **out, struct awk_input *iobuf, int *errcode, cha
   //fprintf(stderr, "get_record\n");
   struct csv_state *state = (struct csv_state *)iobuf->opaque;
 
+  /* free row of previous run */
+  if(state->out_to_free != NULL) {
+    //fprintf(stderr, "freeing row\n");
+    gawk_free(*(state->out_to_free));
+  }
+
   // maybe keep one buffer in opaque struct...
   if(!row_queue_empty(state->row_queue)) {
     //fprintf(stderr, "rq not empty\n");
     row_t row = row_queue_pop_front(state->row_queue);
     //fprintf(stderr, "rq popped\n");
     // when do we free row!? maye gawk does it... ?
-    return emit_record(out, row, rt_start, rt_len);
+    return emit_record(state, out, row, rt_start, rt_len);
   }
 
   size_t buflen = 0;
@@ -169,7 +183,7 @@ static int csv_get_record(char **out, struct awk_input *iobuf, int *errcode, cha
     if(!row_queue_empty(state->row_queue)) {
       //fprintf(stderr, "in loop, popping and emitting record.\n");
       row_t row = row_queue_pop_front(state->row_queue);
-      return emit_record(out, row, rt_start, rt_len);
+      return emit_record(state, out, row, rt_start, rt_len);
     }
   }
 
@@ -184,6 +198,15 @@ csv_can_take_file(const awk_input_buf_t *iobuf) {
     return awk_false;
 
   return (iobuf->fd != INVALID_HANDLE);
+}
+
+static void
+csv_close(awk_input_buf_t *iobuf) {
+  struct csv_state *state = (struct csv_state *)iobuf->opaque;
+  gawk_free(state->read_buffer);
+  csv_free(state->parser);
+  row_queue_destroy(state->row_queue);
+  gawk_free(state);
 }
 
 static awk_bool_t
@@ -207,10 +230,12 @@ csv_take_control_of(awk_input_buf_t *iobuf) {
   struct row_cb_data rcbd = {{0}};
   rcbd.rq = state->row_queue;
   state->rcbd = rcbd;
+  state->out_to_free = NULL;
 
   //fprintf(stderr, "after read...\n");
   iobuf->opaque = state;
   iobuf->get_record = csv_get_record;
+  iobuf->close_func= csv_close;
   //fprintf(stderr, "returning...\n");
   fflush(stderr);
   return awk_true;
@@ -222,7 +247,7 @@ static awk_input_parser_t csv_parser = {
   .take_control_of = csv_take_control_of,
 };
 
-  static awk_bool_t
+static awk_bool_t
 init_csv(void)
 {
   register_input_parser(&csv_parser);
@@ -235,4 +260,4 @@ static awk_ext_func_t func_table[] = {
   { NULL, NULL, 0, 0, awk_false, NULL }
 };
 
-dl_load_func(func_table, readdir, "");
+dl_load_func(func_table, readdir, "")
