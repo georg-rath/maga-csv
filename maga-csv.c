@@ -59,7 +59,7 @@ struct csv_state {
   struct row_cb_data rcbd; /* row callback data */
   char* rt_start; /* row terminator */
   int rt_len; /* row terminator length */
-  char **out_to_free; /* text buffer of previous iteration */
+  char *out_to_free; /* text buffer of previous iteration */
 };
 
 
@@ -112,6 +112,7 @@ static row_t row_new(size_t capacity) {
     .length = 0,
     .text = gawk_malloc(capacity)
   };
+  //fprintf(stderr, "new row: %p\n", rb.text);
   return rb;
 }
 
@@ -142,15 +143,17 @@ static void row_collect(int c, void* data) {
   struct row_cb_data* rcbd = (struct row_cb_data*)data;
   row_queue_push_back(rcbd->rq, &rcbd->row);
   //fprintf(stderr, "row collect end: %d, %s\n", c, rcbd->row.text);
-  rcbd->row.length = 0;
+  rcbd->row = row_new(ROW_INITIAL_CAPACITY);
 }
 
 static int emit_record(struct csv_state *state, char** out, row_t row, char** rt_start, size_t *rt_len) {
   *rt_start = &RT_START;
   *rt_len = RT_LEN;
 
-  state->out_to_free = out;
   *out = row.text;
+  state->out_to_free = *out;
+  //fprintf(stderr, "row: %p, %p, %p, %p\n", state->out_to_free, *(state->out_to_free), out, (void *)*out);
+  fflush(stderr);
   return row.length;
 }
 
@@ -160,8 +163,8 @@ static int csv_get_record(char **out, struct awk_input *iobuf, int *errcode, cha
 
   /* free row of previous run */
   if(state->out_to_free != NULL) {
-    //fprintf(stderr, "freeing row\n");
-    gawk_free(*(state->out_to_free));
+    //fprintf(stderr, "freeing row: %p\n", state->out_to_free);
+    gawk_free(state->out_to_free);
   }
 
   // maybe keep one buffer in opaque struct...
